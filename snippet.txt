@@ -1,1 +1,554 @@
+package com.example.functions;
 
+import com.microsoft.azure.functions.annotation.*;
+import com.microsoft.azure.functions.*;
+import com.example.functions.services.FileProcessorService;
+import java.time.LocalDateTime;
+
+/**
+ * Azure Function that processes files on a timer schedule
+ * This class serves as the entry point for the Azure Function runtime
+ * All business logic is delegated to the FileProcessorService
+ */
+public class FileProcessorFunction {
+    
+    /**
+     * Timer-triggered Azure Function that runs every 10 minutes
+     * @param timerInfo Timer trigger information
+     * @param context Execution context for logging and runtime information
+     */
+    @FunctionName("FileProcessorTimer")
+    public void run(
+        @TimerTrigger(name = "timerInfo", schedule = "0 */10 * * * *") String timerInfo,
+        final ExecutionContext context
+    ) {
+        context.getLogger().info("========================================");
+        context.getLogger().info("FileProcessorTimer function triggered at: " + LocalDateTime.now());
+        context.getLogger().info("Timer info: " + timerInfo);
+        context.getLogger().info("========================================");
+        
+        try {
+            // Create service instance with context for logging
+            FileProcessorService processorService = new FileProcessorService(context);
+            
+            // Process files from all endpoints
+            boolean success = processorService.processAllFiles();
+            
+            if (success) {
+                context.getLogger().info("FileProcessorTimer function completed successfully at: " + LocalDateTime.now());
+            } else {
+                context.getLogger().warning("FileProcessorTimer function completed with issues at: " + LocalDateTime.now());
+            }
+            
+        } catch (IllegalStateException e) {
+            // Configuration errors
+            context.getLogger().severe("Configuration error in FileProcessorTimer function: " + e.getMessage());
+            context.getLogger().severe("Please check your Azure Function App Settings");
+            e.printStackTrace();
+            
+        } catch (Exception e) {
+            // Unexpected errors
+            context.getLogger().severe("Unexpected error in FileProcessorTimer function: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            context.getLogger().info("========================================");
+            context.getLogger().info("FileProcessorTimer function execution ended at: " + LocalDateTime.now());
+            context.getLogger().info("========================================");
+        }
+    }
+}
+
+
+
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "java",
+    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=YOUR_STORAGE_ACCOUNT;AccountKey=YOUR_STORAGE_KEY;EndpointSuffix=core.windows.net",
+    "ENDPOINT_URL_AUDO": "https://your-api-endpoint.com/get-audo-file",
+    "ENDPOINT_URL_BACO": "https://your-api-endpoint.com/get-baco-file",
+    "ENDPOINT_URL_ADDACS": "https://your-api-endpoint.com/get-addacs-file",
+    "ENDPOINT_URL_ARUDD": "https://your-api-endpoint.com/get-arudd-file",
+    "JAVA_HOME": "C:\\Program Files\\Java\\jdk-11",
+    "MAIN_CLASS": "com.example.functions.FileProcessorFunction"
+  },
+  "Host": {
+    "LocalHttpPort": 7071,
+    "CORS": "*",
+    "CORSCredentials": false
+  },
+  "ConnectionStrings": {}
+}
+
+
+package com.example.functions.services;
+
+import com.azure.storage.blob.*;
+import com.azure.storage.blob.models.*;
+import com.microsoft.azure.functions.ExecutionContext;
+import java.io.*;
+import java.net.URI;
+import java.net.http.*;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class FileProcessorService {
+    
+    // File type constants
+    private static final String FILE_TYPE_AUDO = "AUDO";
+    private static final String FILE_TYPE_BACO = "BACO";
+    private static final String FILE_TYPE_ADDACS = "ADDACS";
+    private static final String FILE_TYPE_ARUDD = "ARUDD";
+    
+    // Suffix constants for renaming
+    private static final String SUFFIX_DAF = "DAF";  // For AUDO and BACO
+    private static final String SUFFIX_DFC = "DFC";  // For ADDACS and ARUDD
+    
+    // List of file types to process
+    private static final List<String> FILE_TYPES = Arrays.asList(
+        FILE_TYPE_AUDO, 
+        FILE_TYPE_BACO, 
+        FILE_TYPE_ADDACS, 
+        FILE_TYPE_ARUDD
+    );
+    
+    private final ExecutionContext context;
+    private final String storageConnectionString;
+    private final Map<String, String> endpointUrls;
+    
+    /**
+     * Constructor for FileProcessorService
+     * @param context Azure Function execution context for logging
+     */
+    public FileProcessorService(ExecutionContext context) {
+        this.context = context;
+        this.storageConnectionString = System.getenv("AZURE_STORAGE_CONNECTION_STRING");
+        
+        // Initialize endpoint URLs for each file type
+        this.endpointUrls = new HashMap<>();
+        this.endpointUrls.put(FILE_TYPE_AUDO, System.getenv("ENDPOINT_URL_AUDO"));
+        this.endpointUrls.put(FILE_TYPE_BACO, System.getenv("ENDPOINT_URL_BACO"));
+        this.endpointUrls.put(FILE_TYPE_ADDACS, System.getenv("ENDPOINT_URL_ADDACS"));
+        this.endpointUrls.put(FILE_TYPE_ARUDD, System.getenv("ENDPOINT_URL_ARUDD"));
+        
+        validateConfiguration();
+    }
+    
+    /**
+     * Main processing method - downloads files from all endpoints and processes them
+     * @return true if all files were processed successfully, false if any failed
+     */
+    public boolean processAllFiles() {
+        context.getLogger().info("FileProcessorService: Starting processing for all file types");
+        
+        boolean allSuccessful = true;
+        int successCount = 0;
+        int failureCount = 0;
+        
+        // Process each file type from its specific endpoint
+        for (String fileType : FILE_TYPES) {
+            context.getLogger().info("----------------------------------------");
+            context.getLogger().info("Processing file type: " + fileType);
+            
+            try {
+                boolean success = processFileFromEndpoint(fileType);
+                if (success) {
+                    successCount++;
+                    context.getLogger().info("Successfully processed " + fileType + " file");
+                } else {
+                    failureCount++;
+                    allSuccessful = false;
+                    context.getLogger().warning("Failed to process " + fileType + " file");
+                }
+            } catch (Exception e) {
+                failureCount++;
+                allSuccessful = false;
+                context.getLogger().severe("Exception processing " + fileType + " file: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        
+        context.getLogger().info("----------------------------------------");
+        context.getLogger().info("Processing complete. Success: " + successCount + ", Failures: " + failureCount);
+        
+        return allSuccessful;
+    }
+    
+    /**
+     * Processes a single file from a specific endpoint
+     * @param fileType The type of file to process (AUDO, BACO, ADDACS, ARUDD)
+     * @return true if processing was successful, false otherwise
+     */
+    private boolean processFileFromEndpoint(String fileType) {
+        String endpointUrl = endpointUrls.get(fileType);
+        context.getLogger().info("Calling endpoint for " + fileType + ": " + endpointUrl);
+        
+        try {
+            // Step 1: Download file from specific endpoint
+            FileDownloadResult downloadResult = downloadFileFromEndpoint(endpointUrl, fileType);
+            
+            if (downloadResult == null || downloadResult.getContent() == null || downloadResult.getContent().length == 0) {
+                context.getLogger().warning("No content received from " + fileType + " endpoint");
+                return false;
+            }
+            
+            // Step 2: Validate and extract date/sequence from original filename
+            FileNameComponents components = parseOriginalFileName(downloadResult.getFileName());
+            if (components == null) {
+                context.getLogger().severe("CRITICAL: Invalid filename format received: " + downloadResult.getFileName());
+                context.getLogger().severe("Expected format: Report_YYYYMMDD_NNNNNN");
+                context.getLogger().severe("File processing aborted for " + fileType);
+                return false;
+            }
+            
+            context.getLogger().info("Parsed filename - Date: " + components.date + ", Sequence: " + components.sequence);
+            
+            // Step 3: Generate new filename based on file type
+            String newFileName = generateNewFileName(fileType, components);
+            context.getLogger().info("Renamed file from " + downloadResult.getFileName() + " to " + newFileName);
+            
+            // Step 4: Upload to Azure Blob Storage
+            uploadToBlob(newFileName, downloadResult.getContent(), fileType);
+            
+            context.getLogger().info("Successfully processed " + fileType + " file: " + newFileName);
+            return true;
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error processing " + fileType + " file: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+    
+    /**
+     * Validates that required configuration is present
+     */
+    private void validateConfiguration() {
+        if (storageConnectionString == null || storageConnectionString.isEmpty()) {
+            throw new IllegalStateException("AZURE_STORAGE_CONNECTION_STRING environment variable not configured");
+        }
+        
+        // Validate each endpoint URL
+        for (String fileType : FILE_TYPES) {
+            String url = endpointUrls.get(fileType);
+            if (url == null || url.isEmpty()) {
+                throw new IllegalStateException("ENDPOINT_URL_" + fileType + " environment variable not configured");
+            }
+        }
+        
+        context.getLogger().info("Configuration validated successfully");
+        context.getLogger().info("Endpoints configured for: " + String.join(", ", FILE_TYPES));
+    }
+    
+    /**
+     * Downloads file from a specific endpoint
+     */
+    private FileDownloadResult downloadFileFromEndpoint(String endpointUrl, String fileType) throws Exception {
+        context.getLogger().info("Downloading " + fileType + " file from: " + endpointUrl);
+        
+        HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .build();
+            
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(endpointUrl))
+            .timeout(Duration.ofMinutes(2))
+            .GET()
+            .build();
+        
+        try {
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            
+            if (response.statusCode() == 200) {
+                // Log response headers for debugging
+                logResponseHeaders(response, fileType);
+                
+                // Extract filename from various sources
+                String fileName = extractFileName(response, endpointUrl);
+                
+                if (fileName == null || fileName.isEmpty()) {
+                    context.getLogger().severe("FAILED to determine filename for " + fileType + " from any source");
+                    return null;
+                }
+                
+                context.getLogger().info("Download complete for " + fileType + " - Filename: " + fileName + 
+                                       ", Size: " + response.body().length + " bytes");
+                
+                return new FileDownloadResult(fileName, response.body());
+            } else {
+                context.getLogger().severe("Failed to download " + fileType + " file. HTTP Status: " + response.statusCode());
+                if (response.body() != null && response.body().length > 0) {
+                    context.getLogger().severe("Response body: " + new String(response.body()));
+                }
+                return null;
+            }
+        } catch (Exception e) {
+            context.getLogger().severe("Error downloading " + fileType + " file: " + e.getMessage());
+            throw e;
+        }
+    }
+    
+    /**
+     * Parses the original filename to extract date and sequence number
+     * Expected format: Report_YYYYMMDD_NNNNNN
+     */
+    private FileNameComponents parseOriginalFileName(String fileName) {
+        if (fileName == null || fileName.isEmpty()) {
+            return null;
+        }
+        
+        // Remove extension if present
+        String nameWithoutExt = fileName;
+        int lastDot = fileName.lastIndexOf('.');
+        if (lastDot > 0) {
+            nameWithoutExt = fileName.substring(0, lastDot);
+        }
+        
+        // Pattern for Report_YYYYMMDD_NNNNNN
+        Pattern pattern = Pattern.compile("Report_(\\d{8})_(\\d{6})", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(nameWithoutExt);
+        
+        if (matcher.find()) {
+            String date = matcher.group(1);
+            String sequence = matcher.group(2);
+            return new FileNameComponents(date, sequence);
+        }
+        
+        context.getLogger().warning("Filename does not match expected pattern: " + fileName);
+        return null;
+    }
+    
+    /**
+     * Generates new filename based on file type and extracted components
+     * AUDO/BACO: TYPE_DAF_YYYYMMDD_NNNNNN
+     * ADDACS/ARUDD: TYPE_DFC_YYYYMMDD_NNNNNN
+     */
+    private String generateNewFileName(String fileType, FileNameComponents components) {
+        String suffix;
+        
+        // Determine suffix based on file type
+        switch (fileType) {
+            case FILE_TYPE_AUDO:
+            case FILE_TYPE_BACO:
+                suffix = SUFFIX_DAF;
+                break;
+            case FILE_TYPE_ADDACS:
+            case FILE_TYPE_ARUDD:
+                suffix = SUFFIX_DFC;
+                break;
+            default:
+                // Fallback, should not happen with validation
+                suffix = "UNK";
+                context.getLogger().warning("Unknown file type for suffix determination: " + fileType);
+        }
+        
+        // Build new filename: TYPE_SUFFIX_YYYYMMDD_NNNNNN
+        return String.format("%s_%s_%s_%s", fileType, suffix, components.date, components.sequence);
+    }
+    
+    /**
+     * Attempts to extract filename from multiple sources
+     */
+    private String extractFileName(HttpResponse<byte[]> response, String endpointUrl) {
+        String fileName = null;
+        
+        // Try Content-Disposition header first
+        fileName = extractFileNameFromContentDisposition(response);
+        if (fileName != null && !fileName.isEmpty()) {
+            context.getLogger().info("Filename found in Content-Disposition header: " + fileName);
+            return fileName;
+        }
+        
+        // Try custom headers
+        fileName = extractFileNameFromCustomHeader(response);
+        if (fileName != null && !fileName.isEmpty()) {
+            context.getLogger().info("Filename found in custom header: " + fileName);
+            return fileName;
+        }
+        
+        // Try to extract from URL
+        fileName = extractFileNameFromUrl(endpointUrl);
+        if (fileName != null && !fileName.isEmpty()) {
+            context.getLogger().info("Filename extracted from URL: " + fileName);
+            return fileName;
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Extracts filename from Content-Disposition header
+     */
+    private String extractFileNameFromContentDisposition(HttpResponse<byte[]> response) {
+        String contentDisposition = response.headers()
+            .firstValue("Content-Disposition")
+            .orElse("");
+        
+        if (!contentDisposition.isEmpty()) {
+            Pattern pattern = Pattern.compile("filename[^;=\\n]*=((['\"]).*?\\2|[^;\\n]*)");
+            Matcher matcher = pattern.matcher(contentDisposition);
+            if (matcher.find()) {
+                String fileName = matcher.group(1);
+                // Remove quotes if present
+                fileName = fileName.replaceAll("[\"]", "");
+                return fileName;
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * Extracts filename from custom headers
+     */
+    private String extractFileNameFromCustomHeader(HttpResponse<byte[]> response) {
+        // Check X-Filename header
+        String fileName = response.headers()
+            .firstValue("X-Filename")
+            .orElse("");
+        
+        if (!fileName.isEmpty()) {
+            return fileName;
+        }
+        
+        // Check X-File-Name header (alternative naming)
+        fileName = response.headers()
+            .firstValue("X-File-Name")
+            .orElse("");
+            
+        return fileName.isEmpty() ? null : fileName;
+    }
+    
+    /**
+     * Extracts filename from URL path
+     */
+    private String extractFileNameFromUrl(String url) {
+        try {
+            String path = URI.create(url).getPath();
+            if (path != null && !path.isEmpty()) {
+                int lastSlash = path.lastIndexOf('/');
+                if (lastSlash >= 0 && lastSlash < path.length() - 1) {
+                    return path.substring(lastSlash + 1);
+                }
+            }
+        } catch (Exception e) {
+            context.getLogger().warning("Could not extract filename from URL: " + e.getMessage());
+        }
+        return null;
+    }
+    
+    /**
+     * Uploads processed file to Azure Blob Storage
+     */
+    private void uploadToBlob(String fileName, byte[] content, String fileType) throws Exception {
+        context.getLogger().info("Uploading file to blob storage: " + fileName);
+        
+        try {
+            // Determine container based on file type
+            String containerName = getContainerName(fileType);
+            
+            // Create blob service client
+            BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
+                .connectionString(storageConnectionString)
+                .buildClient();
+            
+            // Get container client
+            BlobContainerClient containerClient = blobServiceClient.getBlobContainerClient(containerName);
+            
+            // Create container if it doesn't exist
+            if (!containerClient.exists()) {
+                containerClient.create();
+                context.getLogger().info("Created container: " + containerName);
+            }
+            
+            // Get blob client
+            BlobClient blobClient = containerClient.getBlobClient(fileName);
+            
+            // Upload file with overwrite option
+            ByteArrayInputStream dataStream = new ByteArrayInputStream(content);
+            blobClient.upload(dataStream, content.length, true);
+            
+            // Set metadata
+            Map<String, String> metadata = new HashMap<>();
+            metadata.put("fileType", fileType);
+            metadata.put("processedTime", LocalDateTime.now().toString());
+            metadata.put("originalSize", String.valueOf(content.length));
+            metadata.put("suffix", fileType.equals(FILE_TYPE_AUDO) || fileType.equals(FILE_TYPE_BACO) ? SUFFIX_DAF : SUFFIX_DFC);
+            blobClient.setMetadata(metadata);
+            
+            context.getLogger().info("Successfully uploaded file to blob storage: " + fileName + 
+                                   " in container: " + containerName);
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error uploading to blob storage: " + e.getMessage());
+            throw e;
+        }
+    }
+    
+    /**
+     * Determines container name based on file type
+     */
+    private String getContainerName(String fileType) {
+        // You can customize this logic
+        // Option 1: All in one container
+        return "processed-files";
+        
+        // Option 2: Separate by suffix type
+        // if (fileType.equals(FILE_TYPE_AUDO) || fileType.equals(FILE_TYPE_BACO)) {
+        //     return "daf-files";
+        // } else {
+        //     return "dfc-files";
+        // }
+    }
+    
+    /**
+     * Logs response headers for debugging
+     */
+    private void logResponseHeaders(HttpResponse<byte[]> response, String fileType) {
+        context.getLogger().info("HTTP Response Headers for " + fileType + ":");
+        response.headers().map().forEach((key, value) -> 
+            context.getLogger().info("  " + key + ": " + String.join(", ", value))
+        );
+    }
+    
+    /**
+     * Inner class to hold filename components
+     */
+    private static class FileNameComponents {
+        final String date;
+        final String sequence;
+        
+        FileNameComponents(String date, String sequence) {
+            this.date = date;
+            this.sequence = sequence;
+        }
+    }
+    
+    /**
+     * Inner class to hold download result
+     */
+    public static class FileDownloadResult {
+        private final String fileName;
+        private final byte[] content;
+        
+        public FileDownloadResult(String fileName, byte[] content) {
+            this.fileName = fileName;
+            this.content = content;
+        }
+        
+        public String getFileName() {
+            return fileName;
+        }
+        
+        public byte[] getContent() {
+            return content;
+        }
+    }
+}
