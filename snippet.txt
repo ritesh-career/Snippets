@@ -4,81 +4,246 @@ import com.microsoft.azure.functions.annotation.*;
 import com.microsoft.azure.functions.*;
 import com.example.functions.services.FileProcessorService;
 import java.time.LocalDateTime;
+import java.util.Optional;
 
 /**
- * Azure Function that processes files on a timer schedule
+ * HTTP-triggered Azure Function that processes files sent via HTTP requests
  * This class serves as the entry point for the Azure Function runtime
  * All business logic is delegated to the FileProcessorService
  */
 public class FileProcessorFunction {
     
     /**
-     * Timer-triggered Azure Function that runs every 10 minutes
-     * @param timerInfo Timer trigger information
+     * HTTP-triggered Azure Function that processes files sent via POST request
+     * @param request HTTP request containing the file data and metadata
      * @param context Execution context for logging and runtime information
+     * @return HTTP response indicating success or failure
      */
-    @FunctionName("FileProcessorTimer")
-    public void run(
-        @TimerTrigger(name = "timerInfo", schedule = "0 */10 * * * *") String timerInfo,
+    @FunctionName("ProcessFile")
+    public HttpResponseMessage processFile(
+        @HttpTrigger(
+            name = "req",
+            methods = {HttpMethod.POST},
+            authLevel = AuthorizationLevel.FUNCTION,
+            route = "files/process"
+        ) HttpRequestMessage<Optional<byte[]>> request,
         final ExecutionContext context
     ) {
         context.getLogger().info("========================================");
-        context.getLogger().info("FileProcessorTimer function triggered at: " + LocalDateTime.now());
-        context.getLogger().info("Timer info: " + timerInfo);
+        context.getLogger().info("FileProcessor HTTP function triggered at: " + LocalDateTime.now());
         context.getLogger().info("========================================");
         
         try {
-            // Create service instance with context for logging
+            // Extract file type from headers or query parameters
+            String fileType = getFileType(request, context);
+            if (fileType == null || fileType.isEmpty()) {
+                String errorMsg = "Missing required parameter: fileType. Must be one of: AUDO, BACO, ADDACS, ARUDD";
+                context.getLogger().severe(errorMsg);
+                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
+                    .body(createErrorResponse(errorMsg))
+                    .header("Content-Type", "application/json")
+                    .build();
+            }
+            
+            // Extract filename from headers
+            String fileName = getFileName(request, context);
+            if (fileName == null || fileName.isEmpty()) {
+                String errorMsg = "Missing required header: X-Filename or Content-Disposition";
+                context.getLogger().severe(errorMsg);
+                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
+                    .body(createErrorResponse(errorMsg))
+                    .header("Content-Type", "application/json")
+                    .build();
+            }
+            
+            // Get file content from request body
+            Optional<byte[]> bodyOptional = request.getBody();
+            if (!bodyOptional.isPresent() || bodyOptional.get().length == 0) {
+                String errorMsg = "No file content provided in request body";
+                context.getLogger().severe(errorMsg);
+                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
+                    .body(createErrorResponse(errorMsg))
+                    .header("Content-Type", "application/json")
+                    .build();
+            }
+            
+            byte[] fileContent = bodyOptional.get();
+            context.getLogger().info("Received file: " + fileName + ", Type: " + fileType + 
+                                   ", Size: " + fileContent.length + " bytes");
+            
+            // Create service instance and process the file
             FileProcessorService processorService = new FileProcessorService(context);
+            FileProcessorService.ProcessingResult result = processorService.processHttpFile(
+                fileName, 
+                fileContent, 
+                fileType
+            );
             
-            // Process files from all endpoints
-            boolean success = processorService.processAllFiles();
-            
-            if (success) {
-                context.getLogger().info("FileProcessorTimer function completed successfully at: " + LocalDateTime.now());
+            if (result.isSuccess()) {
+                context.getLogger().info("File processed successfully: " + result.getUpdatedFileName());
+                return request.createResponseBuilder(HttpStatus.OK)
+                    .body(createSuccessResponse(result))
+                    .header("Content-Type", "application/json")
+                    .build();
             } else {
-                context.getLogger().warning("FileProcessorTimer function completed with issues at: " + LocalDateTime.now());
+                context.getLogger().warning("File processing failed: " + result.getErrorMessage());
+                return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(createErrorResponse("Processing failed: " + result.getErrorMessage()))
+                    .header("Content-Type", "application/json")
+                    .build();
             }
             
         } catch (IllegalStateException e) {
             // Configuration errors
-            context.getLogger().severe("Configuration error in FileProcessorTimer function: " + e.getMessage());
-            context.getLogger().severe("Please check your Azure Function App Settings");
-            e.printStackTrace();
+            context.getLogger().severe("Configuration error: " + e.getMessage());
+            return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(createErrorResponse("Configuration error: " + e.getMessage()))
+                .header("Content-Type", "application/json")
+                .build();
             
         } catch (Exception e) {
             // Unexpected errors
-            context.getLogger().severe("Unexpected error in FileProcessorTimer function: " + e.getMessage());
+            context.getLogger().severe("Unexpected error: " + e.getMessage());
             e.printStackTrace();
+            return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(createErrorResponse("Unexpected error: " + e.getMessage()))
+                .header("Content-Type", "application/json")
+                .build();
+                
         } finally {
             context.getLogger().info("========================================");
-            context.getLogger().info("FileProcessorTimer function execution ended at: " + LocalDateTime.now());
+            context.getLogger().info("FileProcessor function execution ended at: " + LocalDateTime.now());
             context.getLogger().info("========================================");
         }
     }
-}
-
-
-
-{
-  "IsEncrypted": false,
-  "Values": {
-    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "FUNCTIONS_WORKER_RUNTIME": "java",
-    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=YOUR_STORAGE_ACCOUNT;AccountKey=YOUR_STORAGE_KEY;EndpointSuffix=core.windows.net",
-    "ENDPOINT_URL_AUDO": "https://your-api-endpoint.com/get-audo-file",
-    "ENDPOINT_URL_BACO": "https://your-api-endpoint.com/get-baco-file",
-    "ENDPOINT_URL_ADDACS": "https://your-api-endpoint.com/get-addacs-file",
-    "ENDPOINT_URL_ARUDD": "https://your-api-endpoint.com/get-arudd-file",
-    "JAVA_HOME": "C:\\Program Files\\Java\\jdk-11",
-    "MAIN_CLASS": "com.example.functions.FileProcessorFunction"
-  },
-  "Host": {
-    "LocalHttpPort": 7071,
-    "CORS": "*",
-    "CORSCredentials": false
-  },
-  "ConnectionStrings": {}
+    
+    /**
+     * Batch processing endpoint for multiple files
+     * @param request HTTP request to trigger batch processing
+     * @param context Execution context
+     * @return HTTP response with batch processing results
+     */
+    @FunctionName("ProcessAllFiles")
+    public HttpResponseMessage processAllFiles(
+        @HttpTrigger(
+            name = "req",
+            methods = {HttpMethod.POST, HttpMethod.GET},
+            authLevel = AuthorizationLevel.FUNCTION,
+            route = "files/process-all"
+        ) HttpRequestMessage<Optional<String>> request,
+        final ExecutionContext context
+    ) {
+        context.getLogger().info("========================================");
+        context.getLogger().info("Batch FileProcessor triggered at: " + LocalDateTime.now());
+        context.getLogger().info("========================================");
+        
+        try {
+            // Create service instance and process all files from configured endpoints
+            FileProcessorService processorService = new FileProcessorService(context);
+            boolean success = processorService.processAllFiles();
+            
+            if (success) {
+                return request.createResponseBuilder(HttpStatus.OK)
+                    .body("{\"status\":\"success\",\"message\":\"All files processed successfully\"}")
+                    .header("Content-Type", "application/json")
+                    .build();
+            } else {
+                return request.createResponseBuilder(HttpStatus.PARTIAL_CONTENT)
+                    .body("{\"status\":\"partial\",\"message\":\"Some files failed to process. Check logs for details.\"}")
+                    .header("Content-Type", "application/json")
+                    .build();
+            }
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error in batch processing: " + e.getMessage());
+            return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(createErrorResponse("Batch processing failed: " + e.getMessage()))
+                .header("Content-Type", "application/json")
+                .build();
+        }
+    }
+    
+    /**
+     * Extract file type from request (query parameter or header)
+     */
+    private String getFileType(HttpRequestMessage<Optional<byte[]>> request, ExecutionContext context) {
+        // Try query parameter first
+        String fileType = request.getQueryParameters().get("fileType");
+        if (fileType != null && !fileType.isEmpty()) {
+            context.getLogger().info("File type from query parameter: " + fileType);
+            return fileType.toUpperCase();
+        }
+        
+        // Try header
+        fileType = request.getHeaders().get("x-file-type");
+        if (fileType != null && !fileType.isEmpty()) {
+            context.getLogger().info("File type from header: " + fileType);
+            return fileType.toUpperCase();
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Extract filename from request headers
+     */
+    private String getFileName(HttpRequestMessage<Optional<byte[]>> request, ExecutionContext context) {
+        // Try X-Filename header first
+        String fileName = request.getHeaders().get("x-filename");
+        if (fileName != null && !fileName.isEmpty()) {
+            context.getLogger().info("Filename from X-Filename header: " + fileName);
+            return fileName;
+        }
+        
+        // Try Content-Disposition header
+        String contentDisposition = request.getHeaders().get("content-disposition");
+        if (contentDisposition != null && !contentDisposition.isEmpty()) {
+            // Parse filename from Content-Disposition
+            if (contentDisposition.contains("filename=")) {
+                int startIndex = contentDisposition.indexOf("filename=") + 9;
+                int endIndex = contentDisposition.indexOf(";", startIndex);
+                if (endIndex == -1) {
+                    endIndex = contentDisposition.length();
+                }
+                fileName = contentDisposition.substring(startIndex, endIndex)
+                    .replace("\"", "")
+                    .trim();
+                context.getLogger().info("Filename from Content-Disposition: " + fileName);
+                return fileName;
+            }
+        }
+        
+        // Try query parameter as last resort
+        fileName = request.getQueryParameters().get("filename");
+        if (fileName != null && !fileName.isEmpty()) {
+            context.getLogger().info("Filename from query parameter: " + fileName);
+            return fileName;
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Create success response JSON
+     */
+    private String createSuccessResponse(FileProcessorService.ProcessingResult result) {
+        return String.format(
+            "{\"status\":\"success\",\"originalFileName\":\"%s\",\"updatedFileName\":\"%s\",\"fileType\":\"%s\",\"message\":\"File processed successfully\"}",
+            result.getOriginalFileName(),
+            result.getUpdatedFileName(),
+            result.getFileType()
+        );
+    }
+    
+    /**
+     * Create error response JSON
+     */
+    private String createErrorResponse(String errorMessage) {
+        return String.format(
+            "{\"status\":\"error\",\"message\":\"%s\"}",
+            errorMessage.replace("\"", "\\\"")
+        );
+    }
 }
 
 
@@ -86,6 +251,8 @@ package com.example.functions.services;
 
 import com.azure.storage.blob.*;
 import com.azure.storage.blob.models.*;
+import com.azure.data.tables.*;
+import com.azure.data.tables.models.*;
 import com.microsoft.azure.functions.ExecutionContext;
 import java.io.*;
 import java.net.URI;
@@ -123,6 +290,7 @@ public class FileProcessorService {
     private final ExecutionContext context;
     private final String storageConnectionString;
     private final Map<String, String> endpointUrls;
+    private final TableClient tableClient;
     
     /**
      * Constructor for FileProcessorService
@@ -140,6 +308,60 @@ public class FileProcessorService {
         this.endpointUrls.put(FILE_TYPE_ARUDD, System.getenv("ENDPOINT_URL_ARUDD"));
         
         validateConfiguration();
+        
+        // Initialize Azure Table Storage client
+        this.tableClient = initializeTableClient();
+    }
+    
+    /**
+     * Process a file received via HTTP request
+     * @param fileName The name of the file
+     * @param fileContent The file content as byte array
+     * @param fileType The type of file (AUDO, BACO, ADDACS, ARUDD)
+     * @return Processing result with success status and details
+     */
+    public ProcessingResult processHttpFile(String fileName, byte[] fileContent, String fileType) {
+        context.getLogger().info("Processing HTTP-submitted file: " + fileName + ", Type: " + fileType);
+        
+        try {
+            // Validate file type
+            if (!FILE_TYPES.contains(fileType)) {
+                String error = "Invalid file type: " + fileType + ". Must be one of: " + String.join(", ", FILE_TYPES);
+                context.getLogger().severe(error);
+                logFailureToTableStorage(fileType, fileName, error);
+                return new ProcessingResult(false, fileName, null, fileType, error);
+            }
+            
+            // Validate and extract date/sequence from filename
+            FileNameComponents components = parseOriginalFileName(fileName);
+            if (components == null) {
+                String error = "Invalid filename format. Expected: Report_YYYYMMDD_NNNNNN, Received: " + fileName;
+                context.getLogger().severe(error);
+                logFailureToTableStorage(fileType, fileName, error);
+                return new ProcessingResult(false, fileName, null, fileType, error);
+            }
+            
+            context.getLogger().info("Parsed filename - Date: " + components.date + ", Sequence: " + components.sequence);
+            
+            // Generate new filename based on file type
+            String newFileName = generateNewFileName(fileType, components);
+            context.getLogger().info("Generated new filename: " + newFileName);
+            
+            // Upload to Azure Blob Storage
+            uploadToBlob(newFileName, fileContent, fileType);
+            
+            // Log to Azure Table Storage
+            logToTableStorage(fileName, newFileName, fileType);
+            
+            context.getLogger().info("Successfully processed HTTP file: " + newFileName);
+            return new ProcessingResult(true, fileName, newFileName, fileType, null);
+            
+        } catch (Exception e) {
+            String error = "Error processing file: " + e.getMessage();
+            context.getLogger().severe(error);
+            logFailureToTableStorage(fileType, fileName, error);
+            return new ProcessingResult(false, fileName, null, fileType, error);
+        }
     }
     
     /**
@@ -197,6 +419,7 @@ public class FileProcessorService {
             
             if (downloadResult == null || downloadResult.getContent() == null || downloadResult.getContent().length == 0) {
                 context.getLogger().warning("No content received from " + fileType + " endpoint");
+                logFailureToTableStorage(fileType, null, "No content received from endpoint");
                 return false;
             }
             
@@ -206,6 +429,7 @@ public class FileProcessorService {
                 context.getLogger().severe("CRITICAL: Invalid filename format received: " + downloadResult.getFileName());
                 context.getLogger().severe("Expected format: Report_YYYYMMDD_NNNNNN");
                 context.getLogger().severe("File processing aborted for " + fileType);
+                logFailureToTableStorage(fileType, downloadResult.getFileName(), "Invalid filename format");
                 return false;
             }
             
@@ -218,6 +442,9 @@ public class FileProcessorService {
             // Step 4: Upload to Azure Blob Storage
             uploadToBlob(newFileName, downloadResult.getContent(), fileType);
             
+            // Step 5: Log to Azure Table Storage
+            logToTableStorage(downloadResult.getFileName(), newFileName, fileType);
+            
             context.getLogger().info("Successfully processed " + fileType + " file: " + newFileName);
             return true;
             
@@ -225,6 +452,94 @@ public class FileProcessorService {
             context.getLogger().severe("Error processing " + fileType + " file: " + e.getMessage());
             e.printStackTrace();
             return false;
+        }
+    }
+    
+    /**
+     * Initializes the Azure Table Storage client
+     */
+    private TableClient initializeTableClient() {
+        try {
+            String tableName = "FileProcessingLog";
+            
+            // Create table service client
+            TableServiceClient tableServiceClient = new TableServiceClientBuilder()
+                .connectionString(storageConnectionString)
+                .buildClient();
+            
+            // Create table if it doesn't exist
+            try {
+                tableServiceClient.createTableIfNotExists(tableName);
+                context.getLogger().info("Table '" + tableName + "' is ready for use");
+            } catch (Exception e) {
+                // Table might already exist, which is fine
+                context.getLogger().info("Table '" + tableName + "' already exists or was just created");
+            }
+            
+            // Return client for the specific table
+            return tableServiceClient.getTableClient(tableName);
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error initializing Table Storage client: " + e.getMessage());
+            throw new IllegalStateException("Failed to initialize Table Storage", e);
+        }
+    }
+    
+    /**
+     * Logs file processing details to Azure Table Storage
+     */
+    private void logToTableStorage(String originalFileName, String updatedFileName, String fileType) {
+        try {
+            // Create unique partition and row keys
+            // Partition key: Date (YYYYMMDD) for efficient querying by date
+            // Row key: Timestamp with milliseconds + file type for uniqueness
+            String partitionKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String rowKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmssSSS")) + "_" + fileType;
+            
+            // Create table entity with file processing details
+            TableEntity entity = new TableEntity(partitionKey, rowKey);
+            entity.addProperty("OriginalFileName", originalFileName);
+            entity.addProperty("UpdatedFileName", updatedFileName);
+            entity.addProperty("FileType", fileType);
+            entity.addProperty("TimeReceived", LocalDateTime.now().toString());
+            entity.addProperty("ProcessingStatus", "Success");
+            entity.addProperty("Suffix", fileType.equals(FILE_TYPE_AUDO) || fileType.equals(FILE_TYPE_BACO) ? SUFFIX_DAF : SUFFIX_DFC);
+            
+            // Add entity to table
+            tableClient.createEntity(entity);
+            
+            context.getLogger().info("Logged file processing to Azure Table Storage - Partition: " + partitionKey + ", Row: " + rowKey);
+            
+        } catch (Exception e) {
+            // Log error but don't fail the entire process
+            context.getLogger().severe("Error logging to Table Storage: " + e.getMessage());
+            context.getLogger().severe("File was processed successfully but table logging failed");
+            // Continue processing - table logging is not critical
+        }
+    }
+    
+    /**
+     * Logs failed file processing attempts to Azure Table Storage
+     */
+    private void logFailureToTableStorage(String fileType, String originalFileName, String errorMessage) {
+        try {
+            String partitionKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String rowKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmssSSS")) + "_" + fileType + "_FAILED";
+            
+            TableEntity entity = new TableEntity(partitionKey, rowKey);
+            entity.addProperty("OriginalFileName", originalFileName != null ? originalFileName : "UNKNOWN");
+            entity.addProperty("UpdatedFileName", "N/A");
+            entity.addProperty("FileType", fileType);
+            entity.addProperty("TimeReceived", LocalDateTime.now().toString());
+            entity.addProperty("ProcessingStatus", "Failed");
+            entity.addProperty("ErrorMessage", errorMessage);
+            
+            tableClient.createEntity(entity);
+            
+            context.getLogger().info("Logged failure to Azure Table Storage for " + fileType);
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error logging failure to Table Storage: " + e.getMessage());
         }
     }
     
@@ -528,6 +843,46 @@ public class FileProcessorService {
         FileNameComponents(String date, String sequence) {
             this.date = date;
             this.sequence = sequence;
+        }
+    }
+    
+    /**
+     * Result class for processing operations
+     */
+    public static class ProcessingResult {
+        private final boolean success;
+        private final String originalFileName;
+        private final String updatedFileName;
+        private final String fileType;
+        private final String errorMessage;
+        
+        public ProcessingResult(boolean success, String originalFileName, String updatedFileName, 
+                               String fileType, String errorMessage) {
+            this.success = success;
+            this.originalFileName = originalFileName;
+            this.updatedFileName = updatedFileName;
+            this.fileType = fileType;
+            this.errorMessage = errorMessage;
+        }
+        
+        public boolean isSuccess() {
+            return success;
+        }
+        
+        public String getOriginalFileName() {
+            return originalFileName;
+        }
+        
+        public String getUpdatedFileName() {
+            return updatedFileName;
+        }
+        
+        public String getFileType() {
+            return fileType;
+        }
+        
+        public String getErrorMessage() {
+            return errorMessage;
         }
     }
     
