@@ -1,9 +1,531 @@
+package com.example.functions;
+
+import com.microsoft.azure.functions.annotation.*;
+import com.microsoft.azure.functions.*;
+import com.example.functions.services.DM6BankingOutputService;
+import java.time.LocalDateTime;
+import java.util.List;
+
+/**
+ * Timer-triggered Azure Function that retrieves and processes files added today
+ * Runs every 10 minutes to check for new files in blob storage
+ */
+public class DM6BankingOutputFunction {
+    
+    /**
+     * Timer-triggered function that runs every 10 minutes
+     * Retrieves files added today from blob storage and marks them as pulled
+     * @param timerInfo Timer trigger information
+     * @param context Execution context for logging
+     */
+    @FunctionName("RunDM6BankingOutputStream")
+    public void run(
+        @TimerTrigger(
+            name = "dm6Timer", 
+            schedule = "0 */10 * * * *"
+        ) String timerInfo,
+        final ExecutionContext context
+    ) {
+        context.getLogger().info("========================================");
+        context.getLogger().info("DM6 Banking Output Stream triggered at: " + LocalDateTime.now());
+        context.getLogger().info("Timer info: " + timerInfo);
+        context.getLogger().info("========================================");
+        
+        try {
+            // Create service instance
+            DM6BankingOutputService outputService = new DM6BankingOutputService(context);
+            
+            // Retrieve and process today's files
+            DM6BankingOutputService.ProcessingResult result = outputService.retrieveTodaysFiles();
+            
+            // Log results
+            context.getLogger().info("Processing Summary:");
+            context.getLogger().info("  Files found today: " + result.getTotalFilesFound());
+            context.getLogger().info("  New files pulled: " + result.getFilesRetrieved());
+            context.getLogger().info("  Already processed: " + result.getFilesAlreadyProcessed());
+            context.getLogger().info("  Failed to process: " + result.getFilesFailed());
+            
+            // Log file details if any were retrieved
+            if (result.getRetrievedFileNames() != null && !result.getRetrievedFileNames().isEmpty()) {
+                context.getLogger().info("Files retrieved in this run:");
+                for (String fileName : result.getRetrievedFileNames()) {
+                    context.getLogger().info("  - " + fileName);
+                }
+            } else {
+                context.getLogger().info("No new files to retrieve in this run");
+            }
+            
+            if (result.isSuccess()) {
+                context.getLogger().info("DM6 Banking Output Stream completed successfully");
+            } else {
+                context.getLogger().warning("DM6 Banking Output Stream completed with some failures");
+            }
+            
+        } catch (IllegalStateException e) {
+            // Configuration errors
+            context.getLogger().severe("Configuration error in DM6 Banking Output Stream: " + e.getMessage());
+            context.getLogger().severe("Please check your Azure Function App Settings");
+            e.printStackTrace();
+            
+        } catch (Exception e) {
+            // Unexpected errors
+            context.getLogger().severe("Unexpected error in DM6 Banking Output Stream: " + e.getMessage());
+            e.printStackTrace();
+            
+        } finally {
+            context.getLogger().info("========================================");
+            context.getLogger().info("DM6 Banking Output Stream execution ended at: " + LocalDateTime.now());
+            context.getLogger().info("========================================");
+        }
+    }
+    
+    /**
+     * HTTP endpoint for manual triggering (useful for testing)
+     * Allows on-demand execution of the DM6 Banking Output Stream
+     */
+    @FunctionName("TriggerDM6BankingOutputStream")
+    public HttpResponseMessage triggerManually(
+        @HttpTrigger(
+            name = "req",
+            methods = {HttpMethod.POST, HttpMethod.GET},
+            authLevel = AuthorizationLevel.FUNCTION,
+            route = "dm6/trigger"
+        ) HttpRequestMessage<Optional<String>> request,
+        final ExecutionContext context
+    ) {
+        context.getLogger().info("Manual trigger of DM6 Banking Output Stream requested");
+        
+        try {
+            // Create service instance
+            DM6BankingOutputService outputService = new DM6BankingOutputService(context);
+            
+            // Retrieve and process today's files
+            DM6BankingOutputService.ProcessingResult result = outputService.retrieveTodaysFiles();
+            
+            // Create response
+            String responseMessage = String.format(
+                "{\"status\":\"%s\",\"totalFiles\":%d,\"newFilesPulled\":%d,\"alreadyProcessed\":%d,\"failed\":%d,\"retrievedFiles\":%s}",
+                result.isSuccess() ? "success" : "partial",
+                result.getTotalFilesFound(),
+                result.getFilesRetrieved(),
+                result.getFilesAlreadyProcessed(),
+                result.getFilesFailed(),
+                result.getRetrievedFileNames() != null ? 
+                    "\"" + String.join(",", result.getRetrievedFileNames()) + "\"" : "[]"
+            );
+            
+            return request.createResponseBuilder(
+                    result.isSuccess() ? HttpStatus.OK : HttpStatus.PARTIAL_CONTENT
+                )
+                .body(responseMessage)
+                .header("Content-Type", "application/json")
+                .build();
+                
+        } catch (Exception e) {
+            context.getLogger().severe("Error in manual trigger: " + e.getMessage());
+            return request.createResponseBuilder(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("{\"status\":\"error\",\"message\":\"" + e.getMessage() + "\"}")
+                .header("Content-Type", "application/json")
+                .build();
+        }
+    }
+}
+
+-----
+
 package com.example.functions.services;
 
 import com.azure.storage.blob.*;
 import com.azure.storage.blob.models.*;
-import com.azure.data.tables.*;
-import com.azure.data.tables.models.*;
+import com.microsoft.azure.functions.ExecutionContext;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * Service class for retrieving and processing files from blob storage
+ * Handles the DM6 Banking Output Stream logic
+ */
+public class DM6BankingOutputService {
+    
+    // Metadata keys for tracking file processing
+    private static final String METADATA_PULLED_DATE = "pulledDate";
+    private static final String METADATA_PULLED_STATUS = "pulledStatus";
+    private static final String METADATA_PULLED_TIME = "pulledTime";
+    private static final String METADATA_DM6_PROCESSED = "dm6Processed";
+    
+    private final ExecutionContext context;
+    private final String storageConnectionString;
+    private final BlobServiceClient blobServiceClient;
+    private final String containerName;
+    private final String outputDirectory;
+    
+    /**
+     * Constructor for DM6BankingOutputService
+     * @param context Azure Function execution context for logging
+     */
+    public DM6BankingOutputService(ExecutionContext context) {
+        this.context = context;
+        this.storageConnectionString = System.getenv("AZURE_STORAGE_CONNECTION_STRING");
+        this.containerName = System.getenv("BLOB_CONTAINER_NAME") != null ? 
+            System.getenv("BLOB_CONTAINER_NAME") : "processed-files";
+        this.outputDirectory = System.getenv("DM6_OUTPUT_DIRECTORY") != null ?
+            System.getenv("DM6_OUTPUT_DIRECTORY") : "C:/dm6-output";
+        
+        validateConfiguration();
+        
+        // Initialize blob service client
+        this.blobServiceClient = new BlobServiceClientBuilder()
+            .connectionString(storageConnectionString)
+            .buildClient();
+            
+        // Ensure output directory exists
+        ensureOutputDirectory();
+    }
+    
+    /**
+     * Retrieves all files added today that haven't been pulled yet
+     * @return Processing result with statistics and file names
+     */
+    public ProcessingResult retrieveTodaysFiles() {
+        context.getLogger().info("Starting retrieval of today's files from container: " + containerName);
+        
+        ProcessingResult result = new ProcessingResult();
+        List<String> retrievedFiles = new ArrayList<>();
+        
+        try {
+            // Get container client
+            BlobContainerClient containerClient = blobServiceClient.getBlobContainerClient(containerName);
+            
+            if (!containerClient.exists()) {
+                context.getLogger().warning("Container does not exist: " + containerName);
+                return result;
+            }
+            
+            // Get today's date for comparison
+            LocalDate today = LocalDate.now();
+            String todayString = today.format(DateTimeFormatter.ISO_LOCAL_DATE);
+            context.getLogger().info("Checking for files added on: " + todayString);
+            
+            // List all blobs in the container
+            for (BlobItem blobItem : containerClient.listBlobs()) {
+                String blobName = blobItem.getName();
+                result.incrementTotalFiles();
+                
+                try {
+                    // Get blob client
+                    BlobClient blobClient = containerClient.getBlobClient(blobName);
+                    
+                    // Get blob properties and metadata
+                    BlobProperties properties = blobClient.getProperties();
+                    Map<String, String> metadata = properties.getMetadata();
+                    
+                    // Check if blob was created today
+                    OffsetDateTime lastModified = properties.getLastModified();
+                    LocalDate blobDate = lastModified.toLocalDate();
+                    
+                    if (!blobDate.equals(today)) {
+                        context.getLogger().info("Skipping " + blobName + " - not from today (created: " + blobDate + ")");
+                        continue;
+                    }
+                    
+                    // Check if already pulled today
+                    if (isAlreadyPulledToday(metadata, todayString)) {
+                        context.getLogger().info("Skipping " + blobName + " - already pulled today");
+                        result.incrementAlreadyProcessed();
+                        continue;
+                    }
+                    
+                    // Retrieve the file
+                    boolean success = retrieveFile(blobClient, blobName, metadata);
+                    
+                    if (success) {
+                        retrievedFiles.add(blobName);
+                        result.incrementRetrieved();
+                        context.getLogger().info("Successfully retrieved: " + blobName);
+                    } else {
+                        result.incrementFailed();
+                        context.getLogger().warning("Failed to retrieve: " + blobName);
+                    }
+                    
+                } catch (Exception e) {
+                    context.getLogger().severe("Error processing blob " + blobName + ": " + e.getMessage());
+                    result.incrementFailed();
+                }
+            }
+            
+            result.setRetrievedFileNames(retrievedFiles);
+            result.setSuccess(result.getFilesFailed() == 0);
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error retrieving today's files: " + e.getMessage());
+            e.printStackTrace();
+            result.setSuccess(false);
+        }
+        
+        return result;
+    }
+    
+    /**
+     * Checks if a file has already been pulled today
+     */
+    private boolean isAlreadyPulledToday(Map<String, String> metadata, String todayString) {
+        if (metadata == null) {
+            return false;
+        }
+        
+        String pulledDate = metadata.get(METADATA_PULLED_DATE);
+        String dm6Processed = metadata.get(METADATA_DM6_PROCESSED);
+        
+        // Check if pulled date matches today
+        return todayString.equals(pulledDate) && "true".equalsIgnoreCase(dm6Processed);
+    }
+    
+    /**
+     * Retrieves a file from blob storage and saves it locally
+     */
+    private boolean retrieveFile(BlobClient blobClient, String blobName, Map<String, String> existingMetadata) {
+        try {
+            // Download blob content
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            blobClient.downloadStream(outputStream);
+            byte[] content = outputStream.toByteArray();
+            
+            // Save to local file system or process as needed
+            String outputPath = saveToLocalFileSystem(blobName, content);
+            
+            if (outputPath != null) {
+                // Update metadata to mark as pulled
+                Map<String, String> updatedMetadata = new HashMap<>();
+                if (existingMetadata != null) {
+                    updatedMetadata.putAll(existingMetadata);
+                }
+                
+                // Add/update pulled metadata
+                updatedMetadata.put(METADATA_PULLED_DATE, LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE));
+                updatedMetadata.put(METADATA_PULLED_TIME, LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+                updatedMetadata.put(METADATA_PULLED_STATUS, "SUCCESS");
+                updatedMetadata.put(METADATA_DM6_PROCESSED, "true");
+                
+                // Update blob metadata
+                blobClient.setMetadata(updatedMetadata);
+                
+                context.getLogger().info("File saved to: " + outputPath);
+                context.getLogger().info("Metadata updated for: " + blobName);
+                
+                // Optional: Send to DM6 system or perform additional processing
+                boolean dm6Success = sendToDM6System(blobName, content);
+                if (!dm6Success) {
+                    context.getLogger().warning("File retrieved but DM6 processing had issues for: " + blobName);
+                }
+                
+                return true;
+            }
+            
+            return false;
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error retrieving file " + blobName + ": " + e.getMessage());
+            
+            // Try to update metadata to indicate failure
+            try {
+                Map<String, String> failureMetadata = new HashMap<>();
+                if (existingMetadata != null) {
+                    failureMetadata.putAll(existingMetadata);
+                }
+                failureMetadata.put(METADATA_PULLED_STATUS, "FAILED");
+                failureMetadata.put(METADATA_PULLED_TIME, LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+                blobClient.setMetadata(failureMetadata);
+            } catch (Exception metaEx) {
+                context.getLogger().warning("Could not update failure metadata: " + metaEx.getMessage());
+            }
+            
+            return false;
+        }
+    }
+    
+    /**
+     * Saves file content to local file system
+     */
+    private String saveToLocalFileSystem(String blobName, byte[] content) {
+        try {
+            // Create date-based subdirectory
+            String dateDir = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            File dailyDir = new File(outputDirectory, dateDir);
+            if (!dailyDir.exists()) {
+                dailyDir.mkdirs();
+            }
+            
+            // Generate output filename with timestamp to avoid collisions
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
+            String outputFileName = timestamp + "_" + blobName;
+            File outputFile = new File(dailyDir, outputFileName);
+            
+            // Write content to file
+            try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+                fos.write(content);
+                fos.flush();
+            }
+            
+            return outputFile.getAbsolutePath();
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error saving file to local system: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Sends file to DM6 banking system
+     * This is a placeholder - implement actual DM6 integration here
+     */
+    private boolean sendToDM6System(String fileName, byte[] content) {
+        try {
+            // TODO: Implement actual DM6 system integration
+            // This could be:
+            // - HTTP POST to DM6 API
+            // - Write to DM6 watched folder
+            // - Send to message queue
+            // - Direct database insert
+            
+            context.getLogger().info("DM6 processing placeholder for: " + fileName);
+            context.getLogger().info("File size: " + content.length + " bytes");
+            
+            // For now, just log that we would send to DM6
+            // In production, replace with actual integration
+            
+            return true;
+            
+        } catch (Exception e) {
+            context.getLogger().severe("Error in DM6 processing: " + e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Validates required configuration
+     */
+    private void validateConfiguration() {
+        if (storageConnectionString == null || storageConnectionString.isEmpty()) {
+            throw new IllegalStateException("AZURE_STORAGE_CONNECTION_STRING environment variable not configured");
+        }
+        
+        context.getLogger().info("Configuration validated successfully");
+        context.getLogger().info("Container: " + containerName);
+        context.getLogger().info("Output Directory: " + outputDirectory);
+    }
+    
+    /**
+     * Ensures the output directory exists
+     */
+    private void ensureOutputDirectory() {
+        try {
+            File dir = new File(outputDirectory);
+            if (!dir.exists()) {
+                dir.mkdirs();
+                context.getLogger().info("Created output directory: " + outputDirectory);
+            } else {
+                context.getLogger().info("Output directory exists: " + outputDirectory);
+            }
+        } catch (Exception e) {
+            context.getLogger().warning("Could not create output directory: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Result class for processing statistics
+     */
+    public static class ProcessingResult {
+        private int totalFilesFound = 0;
+        private int filesRetrieved = 0;
+        private int filesAlreadyProcessed = 0;
+        private int filesFailed = 0;
+        private boolean success = true;
+        private List<String> retrievedFileNames;
+        
+        public void incrementTotalFiles() {
+            this.totalFilesFound++;
+        }
+        
+        public void incrementRetrieved() {
+            this.filesRetrieved++;
+        }
+        
+        public void incrementAlreadyProcessed() {
+            this.filesAlreadyProcessed++;
+        }
+        
+        public void incrementFailed() {
+            this.filesFailed++;
+        }
+        
+        // Getters and setters
+        public int getTotalFilesFound() {
+            return totalFilesFound;
+        }
+        
+        public int getFilesRetrieved() {
+            return filesRetrieved;
+        }
+        
+        public int getFilesAlreadyProcessed() {
+            return filesAlreadyProcessed;
+        }
+        
+        public int getFilesFailed() {
+            return filesFailed;
+        }
+        
+        public boolean isSuccess() {
+            return success;
+        }
+        
+        public void setSuccess(boolean success) {
+            this.success = success;
+        }
+        
+        public List<String> getRetrievedFileNames() {
+            return retrievedFileNames;
+        }
+        
+        public void setRetrievedFileNames(List<String> retrievedFileNames) {
+            this.retrievedFileNames = retrievedFileNames;
+        }
+    }
+}
+
+
+-----
+
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "java",
+    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=YOUR_STORAGE_ACCOUNT;AccountKey=YOUR_STORAGE_KEY;EndpointSuffix=core.windows.net",
+    "ENDPOINT_URL_ADDACS": "https://your-api-endpoint.com/get-addacs-file",
+    "ENDPOINT_URL_ARUDD": "https://your-api-endpoint.com/get-arudd-file",
+    "JAVA_HOME": "C:\\Program Files\\Java\\jdk-11",
+    "MAIN_CLASS": "com.example.functions.FileProcessorFunction"
+  },
+  "Host": {
+    "LocalHttpPort": 7071,
+    "CORS": "*",
+    "CORSCredentials": false
+  },
+  "ConnectionStrings": {}
+}
+
+
+-----
+
+
+package com.example.functions.services;
+
+import com.azure.storage.blob.*;
+import com.azure.storage.blob.models.*;
 import com.microsoft.azure.functions.ExecutionContext;
 import java.io.*;
 import java.net.URI;
@@ -36,7 +558,6 @@ public class FileProcessorService {
     private final ExecutionContext context;
     private final String storageConnectionString;
     private final Map<String, String> endpointUrls;
-    private final TableClient tableClient;
     
     /**
      * Constructor for FileProcessorService
@@ -52,9 +573,6 @@ public class FileProcessorService {
         this.endpointUrls.put(FILE_TYPE_ARUDD, System.getenv("ENDPOINT_URL_ARUDD"));
         
         validateConfiguration();
-        
-        // Initialize Azure Table Storage client
-        this.tableClient = initializeTableClient();
     }
     
     /**
@@ -72,7 +590,6 @@ public class FileProcessorService {
             if (!FILE_TYPES.contains(fileType)) {
                 String error = "Invalid file type: " + fileType + ". Must be one of: " + String.join(", ", FILE_TYPES);
                 context.getLogger().severe(error);
-                logFailureToTableStorage(fileType, fileName, error);
                 return new ProcessingResult(false, fileName, null, fileType, error);
             }
             
@@ -81,7 +598,6 @@ public class FileProcessorService {
             if (components == null) {
                 String error = "Invalid filename format. Expected: Report_YYYYMMDD_NNNNNN, Received: " + fileName;
                 context.getLogger().severe(error);
-                logFailureToTableStorage(fileType, fileName, error);
                 return new ProcessingResult(false, fileName, null, fileType, error);
             }
             
@@ -94,16 +610,12 @@ public class FileProcessorService {
             // Upload to Azure Blob Storage
             uploadToBlob(newFileName, fileContent, fileType);
             
-            // Log to Azure Table Storage
-            logToTableStorage(fileName, newFileName, fileType);
-            
             context.getLogger().info("Successfully processed HTTP file: " + newFileName);
             return new ProcessingResult(true, fileName, newFileName, fileType, null);
             
         } catch (Exception e) {
             String error = "Error processing file: " + e.getMessage();
             context.getLogger().severe(error);
-            logFailureToTableStorage(fileType, fileName, error);
             return new ProcessingResult(false, fileName, null, fileType, error);
         }
     }
@@ -163,7 +675,6 @@ public class FileProcessorService {
             
             if (downloadResult == null || downloadResult.getContent() == null || downloadResult.getContent().length == 0) {
                 context.getLogger().warning("No content received from " + fileType + " endpoint");
-                logFailureToTableStorage(fileType, null, "No content received from endpoint");
                 return false;
             }
             
@@ -173,7 +684,6 @@ public class FileProcessorService {
                 context.getLogger().severe("CRITICAL: Invalid filename format received: " + downloadResult.getFileName());
                 context.getLogger().severe("Expected format: Report_YYYYMMDD_NNNNNN");
                 context.getLogger().severe("File processing aborted for " + fileType);
-                logFailureToTableStorage(fileType, downloadResult.getFileName(), "Invalid filename format");
                 return false;
             }
             
@@ -186,9 +696,6 @@ public class FileProcessorService {
             // Step 4: Upload to Azure Blob Storage
             uploadToBlob(newFileName, downloadResult.getContent(), fileType);
             
-            // Step 5: Log to Azure Table Storage
-            logToTableStorage(downloadResult.getFileName(), newFileName, fileType);
-            
             context.getLogger().info("Successfully processed " + fileType + " file: " + newFileName);
             return true;
             
@@ -196,94 +703,6 @@ public class FileProcessorService {
             context.getLogger().severe("Error processing " + fileType + " file: " + e.getMessage());
             e.printStackTrace();
             return false;
-        }
-    }
-    
-    /**
-     * Initializes the Azure Table Storage client
-     */
-    private TableClient initializeTableClient() {
-        try {
-            String tableName = "FileProcessingLog";
-            
-            // Create table service client
-            TableServiceClient tableServiceClient = new TableServiceClientBuilder()
-                .connectionString(storageConnectionString)
-                .buildClient();
-            
-            // Create table if it doesn't exist
-            try {
-                tableServiceClient.createTableIfNotExists(tableName);
-                context.getLogger().info("Table '" + tableName + "' is ready for use");
-            } catch (Exception e) {
-                // Table might already exist, which is fine
-                context.getLogger().info("Table '" + tableName + "' already exists or was just created");
-            }
-            
-            // Return client for the specific table
-            return tableServiceClient.getTableClient(tableName);
-            
-        } catch (Exception e) {
-            context.getLogger().severe("Error initializing Table Storage client: " + e.getMessage());
-            throw new IllegalStateException("Failed to initialize Table Storage", e);
-        }
-    }
-    
-    /**
-     * Logs file processing details to Azure Table Storage
-     */
-    private void logToTableStorage(String originalFileName, String updatedFileName, String fileType) {
-        try {
-            // Create unique partition and row keys
-            // Partition key: Date (YYYYMMDD) for efficient querying by date
-            // Row key: Timestamp with milliseconds + file type for uniqueness
-            String partitionKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-            String rowKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmssSSS")) + "_" + fileType;
-            
-            // Create table entity with file processing details
-            TableEntity entity = new TableEntity(partitionKey, rowKey);
-            entity.addProperty("OriginalFileName", originalFileName);
-            entity.addProperty("UpdatedFileName", updatedFileName);
-            entity.addProperty("FileType", fileType);
-            entity.addProperty("TimeReceived", LocalDateTime.now().toString());
-            entity.addProperty("ProcessingStatus", "Success");
-            entity.addProperty("Suffix", SUFFIX_DFC);
-            
-            // Add entity to table
-            tableClient.createEntity(entity);
-            
-            context.getLogger().info("Logged file processing to Azure Table Storage - Partition: " + partitionKey + ", Row: " + rowKey);
-            
-        } catch (Exception e) {
-            // Log error but don't fail the entire process
-            context.getLogger().severe("Error logging to Table Storage: " + e.getMessage());
-            context.getLogger().severe("File was processed successfully but table logging failed");
-            // Continue processing - table logging is not critical
-        }
-    }
-    
-    /**
-     * Logs failed file processing attempts to Azure Table Storage
-     */
-    private void logFailureToTableStorage(String fileType, String originalFileName, String errorMessage) {
-        try {
-            String partitionKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-            String rowKey = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmssSSS")) + "_" + fileType + "_FAILED";
-            
-            TableEntity entity = new TableEntity(partitionKey, rowKey);
-            entity.addProperty("OriginalFileName", originalFileName != null ? originalFileName : "UNKNOWN");
-            entity.addProperty("UpdatedFileName", "N/A");
-            entity.addProperty("FileType", fileType);
-            entity.addProperty("TimeReceived", LocalDateTime.now().toString());
-            entity.addProperty("ProcessingStatus", "Failed");
-            entity.addProperty("ErrorMessage", errorMessage);
-            
-            tableClient.createEntity(entity);
-            
-            context.getLogger().info("Logged failure to Azure Table Storage for " + fileType);
-            
-        } catch (Exception e) {
-            context.getLogger().severe("Error logging failure to Table Storage: " + e.getMessage());
         }
     }
     
@@ -636,8 +1055,133 @@ public class FileProcessorService {
     }
 }
 
--------------------
 
+-----
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>file-processor-function</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Azure Timer Function - File Processor</name>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <java.version>11</java.version>
+        <azure.functions.maven.plugin.version>1.24.0</azure.functions.maven.plugin.version>
+        <azure.functions.java.library.version>3.0.0</azure.functions.java.library.version>
+        <functionAppName>file-processor-function-${build.timestamp}</functionAppName>
+        <functionAppRegion>westeurope</functionAppRegion>
+        <functionResourceGroup>java-functions-group</functionResourceGroup>
+        <functionAppServicePlanName>java-functions-app-service-plan</functionAppServicePlanName>
+        <functionPricingTier>B1</functionPricingTier>
+        <maven.build.timestamp.format>yyyyMMddHHmmss</maven.build.timestamp.format>
+    </properties>
+
+    <dependencies>
+        <!-- Azure Functions Java Library -->
+        <dependency>
+            <groupId>com.microsoft.azure.functions</groupId>
+            <artifactId>azure-functions-java-library</artifactId>
+            <version>${azure.functions.java.library.version}</version>
+        </dependency>
+        
+        <!-- Azure Storage Blob -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-storage-blob</artifactId>
+            <version>12.23.0</version>
+        </dependency>
+        
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.9</version>
+        </dependency>
+        
+        <!-- Test Dependencies -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.9.3</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.3.1</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                </configuration>
+            </plugin>
+            
+            <plugin>
+                <groupId>com.microsoft.azure</groupId>
+                <artifactId>azure-functions-maven-plugin</artifactId>
+                <version>${azure.functions.maven.plugin.version}</version>
+                <configuration>
+                    <appName>${functionAppName}</appName>
+                    <resourceGroup>${functionResourceGroup}</resourceGroup>
+                    <appServicePlanName>${functionAppServicePlanName}</appServicePlanName>
+                    <region>${functionAppRegion}</region>
+                    <pricingTier>${functionPricingTier}</pricingTier>
+                    <runtime>
+                        <os>windows</os>
+                        <javaVersion>11</javaVersion>
+                    </runtime>
+                    <appSettings>
+                        <property>
+                            <name>FUNCTIONS_EXTENSION_VERSION</name>
+                            <value>~4</value>
+                        </property>
+                        <property>
+                            <name>FUNCTIONS_WORKER_RUNTIME</name>
+                            <value>java</value>
+                        </property>
+                        <property>
+                            <name>AZURE_STORAGE_CONNECTION_STRING</name>
+                            <value>${AZURE_STORAGE_CONNECTION_STRING}</value>
+                        </property>
+                        <property>
+                            <name>FILE_ENDPOINT_BASE_URL</name>
+                            <value>${FILE_ENDPOINT_BASE_URL}</value>
+                        </property>
+                    </appSettings>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>package-functions</id>
+                        <goals>
+                            <goal>package</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+-----
 
 package com.example.functions;
 
@@ -887,9 +1431,7 @@ public class FileProcessorFunction {
     }
 }
 
-
----------------------------
-
+-----
 
 {
   "IsEncrypted": false,
@@ -909,7 +1451,6 @@ public class FileProcessorFunction {
   },
   "ConnectionStrings": {}
 }
-
 
 
 
