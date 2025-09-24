@@ -1,1 +1,248 @@
+package com.example.functions;
 
+import com.microsoft.azure.functions.*;
+import com.microsoft.azure.functions.annotation.*;
+import com.azure.storage.blob.*;
+import com.azure.storage.blob.models.BlobHttpHeaders;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.zip.GZIPOutputStream;
+import java.util.Base64;
+
+/**
+ * Azure Functions with HTTP Trigger for file processing pipeline:
+ * Receive → Rename → Encrypt → Compress → Upload to Blob Storage
+ */
+public class FileProcessingFunction {
+    
+    // Simple AES key (in production, store this securely in Key Vault!)
+    private static final String AES_KEY = "MySecretKey12345"; // Must be 16 bytes for AES-128
+    private static final String ALGORITHM = "AES";
+    
+    // Azurite connection string (default for Mac)
+    private static final String AZURITE_CONNECTION = 
+        "DefaultEndpointsProtocol=http;" +
+        "AccountName=devstoreaccount1;" +
+        "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;" +
+        "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;";
+    
+    private static final String CONTAINER_NAME = "processed-files";
+    
+    @FunctionName("ProcessFile")
+    public HttpResponseMessage run(
+            @HttpTrigger(
+                name = "req",
+                methods = {HttpMethod.POST},
+                authLevel = AuthorizationLevel.FUNCTION,
+                dataType = "binary") 
+            HttpRequestMessage<Optional<byte[]>> request,
+            final ExecutionContext context) {
+        
+        Logger logger = context.getLogger();
+        logger.info("File processing function started.");
+
+        try {
+            // Step 1: Get the file content
+            Optional<byte[]> requestBody = request.getBody();
+            
+            if (!requestBody.isPresent() || requestBody.get().length == 0) {
+                return createErrorResponse(request, "No file content received", HttpStatus.BAD_REQUEST);
+            }
+
+            byte[] originalFileContent = requestBody.get();
+            
+            // Step 2: Get original filename and rename with 'Z' suffix
+            String originalFileName = getFileName(request);
+            String renamedFileName = addZSuffix(originalFileName);
+            
+            logger.info(String.format("Processing file: %s → %s (Size: %d bytes)", 
+                originalFileName, renamedFileName, originalFileContent.length));
+
+            // Step 3: Encrypt the file content
+            byte[] encryptedContent = encryptData(originalFileContent, logger);
+            logger.info(String.format("File encrypted. Size after encryption: %d bytes", encryptedContent.length));
+
+            // Step 4: Compress the encrypted content
+            byte[] compressedContent = compressData(encryptedContent, logger);
+            logger.info(String.format("File compressed. Size after compression: %d bytes", compressedContent.length));
+
+            // Step 5: Upload to Blob Storage
+            String blobUrl = uploadToBlob(compressedContent, renamedFileName + ".gz", logger);
+            logger.info(String.format("File uploaded to blob storage: %s", blobUrl));
+
+            // Create success response
+            Map<String, Object> response = new HashMap<>();
+            response.put("success", true);
+            response.put("message", "File processed successfully");
+            response.put("originalFileName", originalFileName);
+            response.put("processedFileName", renamedFileName + ".gz");
+            response.put("originalSize", originalFileContent.length);
+            response.put("encryptedSize", encryptedContent.length);
+            response.put("finalSize", compressedContent.length);
+            response.put("compressionRatio", String.format("%.2f%%", 
+                (1.0 - (double)compressedContent.length / encryptedContent.length) * 100));
+            response.put("blobUrl", blobUrl);
+            response.put("timestamp", new Date().toString());
+
+            return request.createResponseBuilder(HttpStatus.OK)
+                .header("Content-Type", "application/json")
+                .body(response)
+                .build();
+
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error processing file", e);
+            return createErrorResponse(request, "Internal server error: " + e.getMessage(), 
+                HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /**
+     * Get filename from query parameter or header, with fallback
+     */
+    private String getFileName(HttpRequestMessage<Optional<byte[]>> request) {
+        String fileName = request.getQueryParameters().get("filename");
+        if (fileName == null || fileName.isEmpty()) {
+            fileName = extractFileNameFromHeaders(request.getHeaders());
+            if (fileName == null || fileName.isEmpty()) {
+                fileName = "uploaded_file_" + System.currentTimeMillis();
+            }
+        }
+        return fileName;
+    }
+
+    /**
+     * Add 'Z' suffix to filename (before the extension)
+     */
+    private String addZSuffix(String fileName) {
+        int lastDotIndex = fileName.lastIndexOf('.');
+        if (lastDotIndex == -1) {
+            // No extension
+            return fileName + "Z";
+        } else {
+            // Has extension - insert Z before the extension
+            String nameWithoutExt = fileName.substring(0, lastDotIndex);
+            String extension = fileName.substring(lastDotIndex);
+            return nameWithoutExt + "Z" + extension;
+        }
+    }
+
+    /**
+     * Encrypt data using AES encryption
+     */
+    private byte[] encryptData(byte[] data, Logger logger) throws Exception {
+        // Create AES key from our string (pad to 16 bytes)
+        byte[] keyBytes = Arrays.copyOf(AES_KEY.getBytes("UTF-8"), 16);
+        SecretKeySpec secretKey = new SecretKeySpec(keyBytes, ALGORITHM);
+        
+        // Create cipher and encrypt
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+        
+        return cipher.doFinal(data);
+    }
+
+    /**
+     * Compress data using GZIP
+     */
+    private byte[] compressData(byte[] data, Logger logger) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzipOut = new GZIPOutputStream(baos)) {
+            gzipOut.write(data);
+        }
+        return baos.toByteArray();
+    }
+
+    /**
+     * Upload file to Azure Blob Storage (Azurite)
+     */
+    private String uploadToBlob(byte[] data, String fileName, Logger logger) throws Exception {
+        // Create blob service client
+        BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
+            .connectionString(AZURITE_CONNECTION)
+            .buildClient();
+
+        // Get container client (create if doesn't exist)
+        BlobContainerClient containerClient = blobServiceClient.getBlobContainerClient(CONTAINER_NAME);
+        if (!containerClient.exists()) {
+            containerClient.create();
+            logger.info("Created container: " + CONTAINER_NAME);
+        }
+
+        // Generate unique blob name
+        String blobName = System.currentTimeMillis() + "_" + fileName;
+        
+        // Get blob client and upload
+        BlobClient blobClient = containerClient.getBlobClient(blobName);
+        
+        // Set content type
+        BlobHttpHeaders headers = new BlobHttpHeaders()
+            .setContentType("application/gzip")
+            .setContentEncoding("gzip");
+        
+        // Upload the data
+        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(data)) {
+            blobClient.uploadWithResponse(inputStream, data.length, headers, 
+                null, null, null, null, null, null);
+        }
+
+        // Return the blob URL
+        return blobClient.getBlobUrl();
+    }
+
+    /**
+     * Extract filename from Content-Disposition header
+     */
+    private String extractFileNameFromHeaders(Map<String, String> headers) {
+        String contentDisposition = headers.get("content-disposition");
+        if (contentDisposition != null) {
+            String[] parts = contentDisposition.split(";");
+            for (String part : parts) {
+                part = part.trim();
+                if (part.startsWith("filename=")) {
+                    String fileName = part.substring(9);
+                    if (fileName.startsWith("\"") && fileName.endsWith("\"")) {
+                        fileName = fileName.substring(1, fileName.length() - 1);
+                    }
+                    return fileName;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Create standardized error response
+     */
+    private HttpResponseMessage createErrorResponse(HttpRequestMessage<Optional<byte[]>> request, 
+            String errorMessage, HttpStatus status) {
+        Map<String, Object> errorResponse = new HashMap<>();
+        errorResponse.put("success", false);
+        errorResponse.put("error", errorMessage);
+        errorResponse.put("timestamp", new Date().toString());
+        
+        return request.createResponseBuilder(status)
+            .header("Content-Type", "application/json")
+            .body(errorResponse)
+            .build();
+    }
+
+    // Utility method for decryption (if you need it later)
+    public static byte[] decryptData(byte[] encryptedData) throws Exception {
+        byte[] keyBytes = Arrays.copyOf(AES_KEY.getBytes("UTF-8"), 16);
+        SecretKeySpec secretKey = new SecretKeySpec(keyBytes, ALGORITHM);
+        
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.DECRYPT_MODE, secretKey);
+        
+        return cipher.doFinal(encryptedData);
+    }
+}
