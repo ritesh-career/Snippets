@@ -222,8 +222,8 @@ public class FileProcessingFunction {
         
         // Upload the data with metadata
         try (ByteArrayInputStream inputStream = new ByteArrayInputStream(data)) {
-            blobClient.uploadWithResponse(inputStream, data.length, headers, 
-                metadata, null, null, null, null, null);
+            blobClient.uploadWithResponse(inputStream, data.length, null, 
+                headers, metadata, null, null, null, null);
         }
 
         logger.info(String.format("Blob uploaded with metadata - original filename: %s", originalFileName));
