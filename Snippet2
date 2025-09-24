@@ -246,3 +246,49 @@ public class FileProcessingFunction {
         return cipher.doFinal(encryptedData);
     }
 }
+
+
+
+---File rename logic
+
+
+/**
+ * Rename file based on business rules:
+ * - If filename contains ADDACS: rename to ADDACS_DFC_YYYYMMDD_HHMMSS
+ * - If filename contains ARUDD: rename to ARUDD_DFC_YYYYMMDD_HHMMSS
+ * - Otherwise: add 'Z' suffix to original name
+ */
+private String renameFile(String fileName) {
+    String upperFileName = fileName.toUpperCase();
+    
+    // Get current timestamp for naming
+    java.time.LocalDateTime now = java.time.LocalDateTime.now();
+    java.time.format.DateTimeFormatter dateFormatter = 
+        java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd");
+    java.time.format.DateTimeFormatter timeFormatter = 
+        java.time.format.DateTimeFormatter.ofPattern("HHmmss");
+    
+    String dateStr = now.format(dateFormatter);
+    String timeStr = now.format(timeFormatter);
+    
+    // Get original extension if it exists
+    String extension = "";
+    int lastDotIndex = fileName.lastIndexOf('.');
+    if (lastDotIndex != -1) {
+        extension = fileName.substring(lastDotIndex);
+    }
+    
+    if (upperFileName.contains("ADDACS")) {
+        return String.format("ADDACS_DFC_%s_%s%s", dateStr, timeStr, extension);
+    } else if (upperFileName.contains("ARUDD")) {
+        return String.format("ARUDD_DFC_%s_%s%s", dateStr, timeStr, extension);
+    } else {
+        // Fallback to original Z suffix logic
+        if (lastDotIndex == -1) {
+            return fileName + "Z";
+        } else {
+            String nameWithoutExt = fileName.substring(0, lastDotIndex);
+            return nameWithoutExt + "Z" + extension;
+        }
+    }
+}
