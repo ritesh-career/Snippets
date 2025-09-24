@@ -60,9 +60,9 @@ public class FileProcessingFunction {
 
             byte[] originalFileContent = requestBody.get();
             
-            // Step 2: Get original filename and rename with 'Z' suffix
+            // Step 2: Get original filename and rename based on business rules
             String originalFileName = getFileName(request);
-            String renamedFileName = addZSuffix(originalFileName);
+            String renamedFileName = renameFile(originalFileName);
             
             logger.info(String.format("Processing file: %s → %s (Size: %d bytes)", 
                 originalFileName, renamedFileName, originalFileContent.length));
@@ -75,8 +75,8 @@ public class FileProcessingFunction {
             byte[] compressedContent = compressData(encryptedContent, logger);
             logger.info(String.format("File compressed. Size after compression: %d bytes", compressedContent.length));
 
-            // Step 5: Upload to Blob Storage
-            String blobUrl = uploadToBlob(compressedContent, renamedFileName + ".gz", logger);
+            // Step 5: Upload to Blob Storage with metadata
+            String blobUrl = uploadToBlob(compressedContent, renamedFileName + ".gz", originalFileName, logger);
             logger.info(String.format("File uploaded to blob storage: %s", blobUrl));
 
             // Create success response
@@ -85,6 +85,7 @@ public class FileProcessingFunction {
             response.put("message", "File processed successfully");
             response.put("originalFileName", originalFileName);
             response.put("processedFileName", renamedFileName + ".gz");
+            response.put("processingType", getProcessingType(originalFileName));
             response.put("originalSize", originalFileContent.length);
             response.put("encryptedSize", encryptedContent.length);
             response.put("finalSize", compressedContent.length);
@@ -120,18 +121,43 @@ public class FileProcessingFunction {
     }
 
     /**
-     * Add 'Z' suffix to filename (before the extension)
+     * Rename file based on business rules:
+     * - If filename contains ADDACS: rename to ADDACS_DFC_YYYYMMDD_HHMMSS
+     * - If filename contains ARUDD: rename to ARUDD_DFC_YYYYMMDD_HHMMSS
+     * - Otherwise: add 'Z' suffix to original name
      */
-    private String addZSuffix(String fileName) {
+    private String renameFile(String fileName) {
+        String upperFileName = fileName.toUpperCase();
+        
+        // Get current timestamp for naming
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        java.time.format.DateTimeFormatter dateFormatter = 
+            java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd");
+        java.time.format.DateTimeFormatter timeFormatter = 
+            java.time.format.DateTimeFormatter.ofPattern("HHmmss");
+        
+        String dateStr = now.format(dateFormatter);
+        String timeStr = now.format(timeFormatter);
+        
+        // Get original extension if it exists
+        String extension = "";
         int lastDotIndex = fileName.lastIndexOf('.');
-        if (lastDotIndex == -1) {
-            // No extension
-            return fileName + "Z";
+        if (lastDotIndex != -1) {
+            extension = fileName.substring(lastDotIndex);
+        }
+        
+        if (upperFileName.contains("ADDACS")) {
+            return String.format("ADDACS_DFC_%s_%s%s", dateStr, timeStr, extension);
+        } else if (upperFileName.contains("ARUDD")) {
+            return String.format("ARUDD_DFC_%s_%s%s", dateStr, timeStr, extension);
         } else {
-            // Has extension - insert Z before the extension
-            String nameWithoutExt = fileName.substring(0, lastDotIndex);
-            String extension = fileName.substring(lastDotIndex);
-            return nameWithoutExt + "Z" + extension;
+            // Fallback to original Z suffix logic
+            if (lastDotIndex == -1) {
+                return fileName + "Z";
+            } else {
+                String nameWithoutExt = fileName.substring(0, lastDotIndex);
+                return nameWithoutExt + "Z" + extension;
+            }
         }
     }
 
@@ -162,9 +188,9 @@ public class FileProcessingFunction {
     }
 
     /**
-     * Upload file to Azure Blob Storage (Azurite)
+     * Upload file to Azure Blob Storage (Azurite) with original filename as metadata
      */
-    private String uploadToBlob(byte[] data, String fileName, Logger logger) throws Exception {
+    private String uploadToBlob(byte[] data, String fileName, String originalFileName, Logger logger) throws Exception {
         // Create blob service client
         BlobServiceClient blobServiceClient = new BlobServiceClientBuilder()
             .connectionString(AZURITE_CONNECTION)
@@ -177,25 +203,47 @@ public class FileProcessingFunction {
             logger.info("Created container: " + CONTAINER_NAME);
         }
 
-        // Generate unique blob name
+        // Generate unique blob name with timestamp prefix
         String blobName = System.currentTimeMillis() + "_" + fileName;
         
-        // Get blob client and upload
+        // Get blob client
         BlobClient blobClient = containerClient.getBlobClient(blobName);
         
-        // Set content type
+        // Set content type and headers
         BlobHttpHeaders headers = new BlobHttpHeaders()
             .setContentType("application/gzip")
             .setContentEncoding("gzip");
         
-        // Upload the data
+        // Set metadata including original filename
+        Map<String, String> metadata = new HashMap<>();
+        metadata.put("originalFileName", originalFileName);
+        metadata.put("processedAt", java.time.Instant.now().toString());
+        metadata.put("processingType", getProcessingType(originalFileName));
+        
+        // Upload the data with metadata
         try (ByteArrayInputStream inputStream = new ByteArrayInputStream(data)) {
             blobClient.uploadWithResponse(inputStream, data.length, headers, 
-                null, null, null, null, null, null);
+                metadata, null, null, null, null, null);
         }
+
+        logger.info(String.format("Blob uploaded with metadata - original filename: %s", originalFileName));
 
         // Return the blob URL
         return blobClient.getBlobUrl();
+    }
+
+    /**
+     * Determine processing type based on filename
+     */
+    private String getProcessingType(String fileName) {
+        String upperFileName = fileName.toUpperCase();
+        if (upperFileName.contains("ADDACS")) {
+            return "ADDACS_PROCESSING";
+        } else if (upperFileName.contains("ARUDD")) {
+            return "ARUDD_PROCESSING";
+        } else {
+            return "STANDARD_PROCESSING";
+        }
     }
 
     /**
@@ -244,51 +292,5 @@ public class FileProcessingFunction {
         cipher.init(Cipher.DECRYPT_MODE, secretKey);
         
         return cipher.doFinal(encryptedData);
-    }
-}
-
-
-
----File rename logic
-
-
-/**
- * Rename file based on business rules:
- * - If filename contains ADDACS: rename to ADDACS_DFC_YYYYMMDD_HHMMSS
- * - If filename contains ARUDD: rename to ARUDD_DFC_YYYYMMDD_HHMMSS
- * - Otherwise: add 'Z' suffix to original name
- */
-private String renameFile(String fileName) {
-    String upperFileName = fileName.toUpperCase();
-    
-    // Get current timestamp for naming
-    java.time.LocalDateTime now = java.time.LocalDateTime.now();
-    java.time.format.DateTimeFormatter dateFormatter = 
-        java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd");
-    java.time.format.DateTimeFormatter timeFormatter = 
-        java.time.format.DateTimeFormatter.ofPattern("HHmmss");
-    
-    String dateStr = now.format(dateFormatter);
-    String timeStr = now.format(timeFormatter);
-    
-    // Get original extension if it exists
-    String extension = "";
-    int lastDotIndex = fileName.lastIndexOf('.');
-    if (lastDotIndex != -1) {
-        extension = fileName.substring(lastDotIndex);
-    }
-    
-    if (upperFileName.contains("ADDACS")) {
-        return String.format("ADDACS_DFC_%s_%s%s", dateStr, timeStr, extension);
-    } else if (upperFileName.contains("ARUDD")) {
-        return String.format("ARUDD_DFC_%s_%s%s", dateStr, timeStr, extension);
-    } else {
-        // Fallback to original Z suffix logic
-        if (lastDotIndex == -1) {
-            return fileName + "Z";
-        } else {
-            String nameWithoutExt = fileName.substring(0, lastDotIndex);
-            return nameWithoutExt + "Z" + extension;
-        }
     }
 }
